@@ -6,7 +6,8 @@
 #include "Runtime/Navmesh/Public/Detour/DetourNavMesh.h"
 #include "Runtime/Engine/Classes/Kismet/KismetMathLibrary.h"
 #include "NavigationSystem.h"
-#include "RecastNavMeshGenerator.h"
+#include "NavMesh/RecastNavMeshGenerator.h"
+#include "NavigationOctree.h"
 
 
 FServerRecastGeometryCache::FServerRecastGeometryCache(const uint8* Memory)
@@ -44,66 +45,94 @@ void FExportNavMesh::MyExportNavigationData(const FString& FileName)
 			};
 			TArray<FAreaExportData> AreaExport;
 
-			for (FNavigationOctree::TConstElementBoxIterator<FNavigationOctree::DefaultStackAllocator> It(*NavOctree, GetTotalBounds());
-				It.HasPendingElements();
-				It.Advance())
-			{
-				const FNavigationOctreeElement& Element = It.GetCurrentElement();
-				const bool bExportGeometry = Element.Data->HasGeometry() && Element.ShouldUseGeometry(GetOwner()->GetConfig());
-
-				if (bExportGeometry && Element.Data->CollisionData.Num())
+			NavOctree->FindElementsWithBoundsTest(TotalNavBounds, [this, NavData, &IndexBuffer, &CoordBuffer, &AreaExport](const FNavigationOctreeElement& Element)
 				{
-					FServerRecastGeometryCache CachedGeometry(Element.Data->CollisionData.GetData());
-					IndexBuffer.Reserve(IndexBuffer.Num() + (CachedGeometry.Header.NumFaces * 3));
-					CoordBuffer.Reserve(CoordBuffer.Num() + (CachedGeometry.Header.NumVerts * 3));
+					const bool bExportGeometry = Element.Data->HasGeometry() && Element.ShouldUseGeometry(DestNavMesh->GetConfig());
 
-					// For is invert it need for invert normals
-					for (int32 i = CachedGeometry.Header.NumFaces * 3 - 1; i >= 0 ; --i)
+					TArray<FTransform> InstanceTransforms;
+					Element.Data->NavDataPerInstanceTransformDelegate.ExecuteIfBound(Element.Bounds.GetBox(), InstanceTransforms);
+
+					if (bExportGeometry && Element.Data->CollisionData.Num())
 					{
-						IndexBuffer.Add(CachedGeometry.Indices[i] + CoordBuffer.Num() / 3);
-					}
+						const int32 NumInstances = FMath::Max(InstanceTransforms.Num(), 1);
+						FServerRecastGeometryCache CachedGeometry(Element.Data->CollisionData.GetData());
+						IndexBuffer.Reserve(IndexBuffer.Num() + (CachedGeometry.Header.NumFaces * 3) * NumInstances);
+						CoordBuffer.Reserve(CoordBuffer.Num() + (CachedGeometry.Header.NumVerts * 3) * NumInstances);
 
-					// Calcilate the Vertecs
-					for (int32 i = 0; i < CachedGeometry.Header.NumVerts * 3; i += 3) 
-					{
-						FVector Coord = FVector(
-							CachedGeometry.Verts[i] / 100.f * -1.f,
-							CachedGeometry.Verts[i + 2] / 100.f,
-							CachedGeometry.Verts[i + 1] / 100.f
-						);
-						FVector NewCoord = ChangeDirectionOfPoint(Coord);
-
-						///CoordBuffer.Add(CachedGeometry.Verts[i] / 100.f);
-						CoordBuffer.Add(NewCoord.X);
-						CoordBuffer.Add(NewCoord.Z );
-						CoordBuffer.Add(NewCoord.Y );
-					}
-				}
-				else
-				{
-					const TArray<FAreaNavModifier>& AreaMods = Element.Data->Modifiers.GetAreas();
-					for (int32 i = 0; i < AreaMods.Num(); i++)
-					{
-						FAreaExportData ExportInfo;
-						ExportInfo.AreaId = NavData->GetAreaID(AreaMods[i].GetAreaClass());
-
-						if (AreaMods[i].GetShapeType() == ENavigationShapeType::Convex)
+						if (InstanceTransforms.Num() == 0)
 						{
-							AreaMods[i].GetConvex(ExportInfo.Convex);
+							for (int32 i = 0; i < CachedGeometry.Header.NumFaces * 3; i++)
+							{
+								IndexBuffer.Add(CachedGeometry.Indices[i] + CoordBuffer.Num() / 3);
+							}
+							for (int32 i = 0; i < CachedGeometry.Header.NumVerts * 3; i++)
+							{
+								CoordBuffer.Add(CachedGeometry.Verts[i]);
+							}
+						}
+						for (const FTransform& InstanceTransform : InstanceTransforms)
+						{
+							for (int32 i = 0; i < CachedGeometry.Header.NumFaces * 3; i++)
+							{
+								IndexBuffer.Add(CachedGeometry.Indices[i] + CoordBuffer.Num() / 3);
+							}
 
-							TArray<FVector> ConvexVerts;
-							GrowConvexHull(NavData->AgentRadius, ExportInfo.Convex.Points, ConvexVerts);
-							ExportInfo.Convex.MinZ -= NavData->CellHeight;
-							ExportInfo.Convex.MaxZ += NavData->CellHeight;
-							ExportInfo.Convex.Points = ConvexVerts;
+							FMatrix LocalToRecastWorld = InstanceTransform.ToMatrixWithScale() * Unreal2RecastMatrix();
 
-							AreaExport.Add(ExportInfo);
+							for (int32 i = 0; i < CachedGeometry.Header.NumVerts * 3; i += 3)
+							{
+								// collision cache stores coordinates in recast space, convert them to unreal and transform to recast world space
+								FVector WorldRecastCoord = LocalToRecastWorld.TransformPosition(Recast2UnrealPoint(&CachedGeometry.Verts[i]));
+
+								CoordBuffer.Add(WorldRecastCoord.X);
+								CoordBuffer.Add(WorldRecastCoord.Y);
+								CoordBuffer.Add(WorldRecastCoord.Z);
+							}
 						}
 					}
-				}
-			}
+					else
+					{
+						for (const FAreaNavModifier& AreaMod : Element.Data->Modifiers.GetAreas())
+						{
+							ENavigationShapeType::Type ShapeType = AreaMod.GetShapeType();
 
-			// I don't now what doing this part
+							if (ShapeType == ENavigationShapeType::Convex || ShapeType == ENavigationShapeType::InstancedConvex)
+							{
+								FAreaExportData ExportInfo;
+								ExportInfo.AreaId = NavData->GetAreaID(AreaMod.GetAreaClass());
+
+								auto AddAreaExportDataFunc = [&](const FConvexNavAreaData& InConvexNavAreaData)
+								{
+									TArray<FVector> ConvexVerts;
+									GrowConvexHull(NavData->AgentRadius, ExportInfo.Convex.Points, ConvexVerts);
+									if (ConvexVerts.Num())
+									{
+										ExportInfo.Convex.MinZ -= NavData->CellHeight;
+										ExportInfo.Convex.MaxZ += NavData->CellHeight;
+										ExportInfo.Convex.Points = ConvexVerts;
+
+										AreaExport.Add(ExportInfo);
+									}
+								};
+
+								if (ShapeType == ENavigationShapeType::Convex)
+								{
+									AreaMod.GetConvex(ExportInfo.Convex);
+									AddAreaExportDataFunc(ExportInfo.Convex);
+								}
+								else // ShapeType == ENavigationShapeType::InstancedConvex
+								{
+									for (const FTransform& InstanceTransform : InstanceTransforms)
+									{
+										AreaMod.GetPerInstanceConvex(InstanceTransform, ExportInfo.Convex);
+										AddAreaExportDataFunc(ExportInfo.Convex);
+									}
+								}
+							}
+						}
+					}
+				});
+
 			UWorld* NavigationWorld = GetWorld();
 			for (int32 LevelIndex = 0; LevelIndex < NavigationWorld->GetNumLevels(); ++LevelIndex)
 			{
@@ -119,17 +148,14 @@ void FExportNavMesh::MyExportNavigationData(const FString& FileName)
 					TNavStatArray<FVector> Verts;
 					TNavStatArray<int32> Faces;
 					// For every ULevel in World take its pre-generated static geometry vertex soup
-					TransformVertexSoupToRecast(*LevelGeom, Verts, Faces); //RecastGeometryExport::
+					TransformVertexSoupToRecast(*LevelGeom, Verts, Faces); //RecastGeometryExport
 
 					IndexBuffer.Reserve(IndexBuffer.Num() + Faces.Num());
 					CoordBuffer.Reserve(CoordBuffer.Num() + Verts.Num() * 3);
-
 					for (int32 i = 0; i < Faces.Num(); i++)
 					{
 						IndexBuffer.Add(Faces[i] + CoordBuffer.Num() / 3);
 					}
-					//
-
 					for (int32 i = 0; i < Verts.Num(); i++)
 					{
 						CoordBuffer.Add(Verts[i].X);
@@ -138,6 +164,7 @@ void FExportNavMesh::MyExportNavigationData(const FString& FileName)
 					}
 				}
 			}
+
 
 			FString AreaExportStr;
 			for (int32 i = 0; i < AreaExport.Num(); i++)
@@ -170,7 +197,7 @@ void FExportNavMesh::MyExportNavigationData(const FString& FileName)
 			Extent = FVector(Extent.X, Extent.Z, Extent.Y);
 #else
 			// this bounds match navigation bounds from level
-			FBox RCNavBounds = Unreal2RecastBox(GetTotalBounds());
+			FBox RCNavBounds = Unreal2RecastBox(TotalNavBounds);
 			const FVector Center = RCNavBounds.GetCenter();
 			const FVector Extent = RCNavBounds.GetExtent();
 #endif
@@ -219,11 +246,217 @@ void FExportNavMesh::MyExportNavigationData(const FString& FileName)
 
 			AdditionalData += FString::Printf(TEXT("\n"));
 
-			const FString FilePathName = FileName + ".obj";// +FString::Printf(TEXT("_NavDataSet%d_%s.obj"), Index, *CurrentTimeStr);
+			const FString FilePathName = FileName + FString::Printf(TEXT("_NavDataSet%d_%s.obj"), Index, *CurrentTimeStr);
 			ExportGeomToOBJFile(FilePathName, CoordBuffer, IndexBuffer, AdditionalData);
 		}
 	}
 	UE_LOG(LogNavigation, Log, TEXT("ExportNavigation time: %.3f sec ."), FPlatformTime::Seconds() - StartExportTime);
+//	const UNavigationSystemV1* NavSys = FNavigationSystem::GetCurrent<UNavigationSystemV1>(GetWorld());
+//	const FNavigationOctree* NavOctree = NavSys ? NavSys->GetNavOctree() : NULL;
+//	if (NavOctree == NULL)
+//	{
+//		UE_LOG(LogNavigation, Error, TEXT("Failed to export navigation data due to %s being NULL"), NavSys == NULL ? TEXT("NavigationSystem") : TEXT("NavOctree"));
+//		return;
+//	}
+//
+//	const double StartExportTime = FPlatformTime::Seconds();
+//
+//	FString CurrentTimeStr = FDateTime::Now().ToString();
+//	for (int32 Index = 0; Index < NavSys->NavDataSet.Num(); ++Index)
+//	{
+//		// feed data from octtree and mark for rebuild				
+//		TNavStatArray<float> CoordBuffer;
+//		TNavStatArray<int32> IndexBuffer;
+//		const ARecastNavMesh* NavData = Cast<const ARecastNavMesh>(NavSys->NavDataSet[Index]);
+//		if (NavData)
+//		{
+//			struct FAreaExportData
+//			{
+//				FConvexNavAreaData Convex;
+//				uint8 AreaId;
+//			};
+//			TArray<FAreaExportData> AreaExport;
+//
+//			for (FNavigationOctree::TConstElementBoxIterator<FNavigationOctree::DefaultStackAllocator> It(*NavOctree, GetTotalBounds());
+//				It.HasPendingElements();
+//				It.Advance())
+//			{
+//				const FNavigationOctreeElement& Element = It.GetCurrentElement();
+//				const bool bExportGeometry = Element.Data->HasGeometry() && Element.ShouldUseGeometry(GetOwner()->GetConfig());
+//
+//				if (bExportGeometry && Element.Data->CollisionData.Num())
+//				{
+//					FServerRecastGeometryCache CachedGeometry(Element.Data->CollisionData.GetData());
+//					IndexBuffer.Reserve(IndexBuffer.Num() + (CachedGeometry.Header.NumFaces * 3));
+//					CoordBuffer.Reserve(CoordBuffer.Num() + (CachedGeometry.Header.NumVerts * 3));
+//
+//					// For is invert it need for invert normals
+//					for (int32 i = CachedGeometry.Header.NumFaces * 3 - 1; i >= 0 ; --i)
+//					{
+//						IndexBuffer.Add(CachedGeometry.Indices[i] + CoordBuffer.Num() / 3);
+//					}
+//
+//					// Calcilate the Vertecs
+//					for (int32 i = 0; i < CachedGeometry.Header.NumVerts * 3; i += 3) 
+//					{
+//						FVector Coord = FVector(
+//							CachedGeometry.Verts[i] / 100.f * -1.f,
+//							CachedGeometry.Verts[i + 2] / 100.f,
+//							CachedGeometry.Verts[i + 1] / 100.f
+//						);
+//						FVector NewCoord = ChangeDirectionOfPoint(Coord);
+//
+//						///CoordBuffer.Add(CachedGeometry.Verts[i] / 100.f);
+//						CoordBuffer.Add(NewCoord.X);
+//						CoordBuffer.Add(NewCoord.Z );
+//						CoordBuffer.Add(NewCoord.Y );
+//					}
+//				}
+//				else
+//				{
+//					const TArray<FAreaNavModifier>& AreaMods = Element.Data->Modifiers.GetAreas();
+//					for (int32 i = 0; i < AreaMods.Num(); i++)
+//					{
+//						FAreaExportData ExportInfo;
+//						ExportInfo.AreaId = NavData->GetAreaID(AreaMods[i].GetAreaClass());
+//
+//						if (AreaMods[i].GetShapeType() == ENavigationShapeType::Convex)
+//						{
+//							AreaMods[i].GetConvex(ExportInfo.Convex);
+//
+//							TArray<FVector> ConvexVerts;
+//							GrowConvexHull(NavData->AgentRadius, ExportInfo.Convex.Points, ConvexVerts);
+//							ExportInfo.Convex.MinZ -= NavData->CellHeight;
+//							ExportInfo.Convex.MaxZ += NavData->CellHeight;
+//							ExportInfo.Convex.Points = ConvexVerts;
+//
+//							AreaExport.Add(ExportInfo);
+//						}
+//					}
+//				}
+//			}
+//
+//			// I don't now what doing this part
+//			UWorld* NavigationWorld = GetWorld();
+//			for (int32 LevelIndex = 0; LevelIndex < NavigationWorld->GetNumLevels(); ++LevelIndex)
+//			{
+//				const ULevel* const Level = NavigationWorld->GetLevel(LevelIndex);
+//				if (Level == NULL)
+//				{
+//					continue;
+//				}
+//
+//				const TArray<FVector>* LevelGeom = Level->GetStaticNavigableGeometry();
+//				if (LevelGeom != NULL && LevelGeom->Num() > 0)
+//				{
+//					TNavStatArray<FVector> Verts;
+//					TNavStatArray<int32> Faces;
+//					// For every ULevel in World take its pre-generated static geometry vertex soup
+//					TransformVertexSoupToRecast(*LevelGeom, Verts, Faces); //RecastGeometryExport::
+//
+//					IndexBuffer.Reserve(IndexBuffer.Num() + Faces.Num());
+//					CoordBuffer.Reserve(CoordBuffer.Num() + Verts.Num() * 3);
+//
+//					for (int32 i = 0; i < Faces.Num(); i++)
+//					{
+//						IndexBuffer.Add(Faces[i] + CoordBuffer.Num() / 3);
+//					}
+//					//
+//
+//					for (int32 i = 0; i < Verts.Num(); i++)
+//					{
+//						CoordBuffer.Add(Verts[i].X);
+//						CoordBuffer.Add(Verts[i].Y);
+//						CoordBuffer.Add(Verts[i].Z);
+//					}
+//				}
+//			}
+//
+//			FString AreaExportStr;
+//			for (int32 i = 0; i < AreaExport.Num(); i++)
+//			{
+//				const FAreaExportData& ExportInfo = AreaExport[i];
+//				AreaExportStr += FString::Printf(TEXT("\nAE %d %d %f %f\n"),
+//					ExportInfo.AreaId, ExportInfo.Convex.Points.Num(), ExportInfo.Convex.MinZ, ExportInfo.Convex.MaxZ);
+//
+//				for (int32 iv = 0; iv < ExportInfo.Convex.Points.Num(); iv++)
+//				{
+//					FVector Pt = Unreal2RecastPoint(ExportInfo.Convex.Points[iv]);
+//					AreaExportStr += FString::Printf(TEXT("Av %f %f %f\n"), Pt.X, Pt.Y, Pt.Z);
+//				}
+//			}
+//
+//			FString AdditionalData;
+//
+//			if (AreaExport.Num())
+//			{
+//				AdditionalData += "# Area export\n";
+//				AdditionalData += AreaExportStr;
+//				AdditionalData += "\n";
+//			}
+//
+//			AdditionalData += "# RecastDemo specific data\n";
+//#if 0
+//			// use this bounds to have accurate navigation data bounds
+//			const FVector Center = Unreal2RecastPoint(NavData->GetBounds().GetCenter());
+//			FVector Extent = FVector(NavData->GetBounds().GetExtent());
+//			Extent = FVector(Extent.X, Extent.Z, Extent.Y);
+//#else
+//			// this bounds match navigation bounds from level
+//			FBox RCNavBounds = Unreal2RecastBox(GetTotalBounds());
+//			const FVector Center = RCNavBounds.GetCenter();
+//			const FVector Extent = RCNavBounds.GetExtent();
+//#endif
+//			const FBox Box = FBox::BuildAABB(Center, Extent);
+//			AdditionalData += FString::Printf(
+//				TEXT("rd_bbox %7.7f %7.7f %7.7f %7.7f %7.7f %7.7f\n"),
+//				Box.Min.X, Box.Min.Y, Box.Min.Z,
+//				Box.Max.X, Box.Max.Y, Box.Max.Z
+//			);
+//
+//			const FRecastNavMeshGenerator* CurrentGen = static_cast<const FRecastNavMeshGenerator*>(NavData->GetGenerator());
+//			check(CurrentGen);
+//			AdditionalData += FString::Printf(TEXT("# AgentHeight\n"));
+//			AdditionalData += FString::Printf(TEXT("rd_agh %5.5f\n"), CurrentGen->GetConfig().AgentHeight);
+//			AdditionalData += FString::Printf(TEXT("# AgentRadius\n"));
+//			AdditionalData += FString::Printf(TEXT("rd_agr %5.5f\n"), CurrentGen->GetConfig().AgentRadius);
+//
+//			AdditionalData += FString::Printf(TEXT("# Cell Size\n"));
+//			AdditionalData += FString::Printf(TEXT("rd_cs %5.5f\n"), CurrentGen->GetConfig().cs);
+//			AdditionalData += FString::Printf(TEXT("# Cell Height\n"));
+//			AdditionalData += FString::Printf(TEXT("rd_ch %5.5f\n"), CurrentGen->GetConfig().ch);
+//
+//			AdditionalData += FString::Printf(TEXT("# Agent max climb\n"));
+//			AdditionalData += FString::Printf(TEXT("rd_amc %d\n"), (int)CurrentGen->GetConfig().AgentMaxClimb);
+//			AdditionalData += FString::Printf(TEXT("# Agent max slope\n"));
+//			AdditionalData += FString::Printf(TEXT("rd_ams %5.5f\n"), CurrentGen->GetConfig().walkableSlopeAngle);
+//
+//			AdditionalData += FString::Printf(TEXT("# Region min size\n"));
+//			AdditionalData += FString::Printf(TEXT("rd_rmis %d\n"), (uint32)FMath::Sqrt(CurrentGen->GetConfig().minRegionArea));
+//			AdditionalData += FString::Printf(TEXT("# Region merge size\n"));
+//			AdditionalData += FString::Printf(TEXT("rd_rmas %d\n"), (uint32)FMath::Sqrt(CurrentGen->GetConfig().mergeRegionArea));
+//
+//			AdditionalData += FString::Printf(TEXT("# Max edge len\n"));
+//			AdditionalData += FString::Printf(TEXT("rd_mel %d\n"), CurrentGen->GetConfig().maxEdgeLen);
+//
+//			AdditionalData += FString::Printf(TEXT("# Perform Voxel Filtering\n"));
+//			AdditionalData += FString::Printf(TEXT("rd_pvf %d\n"), CurrentGen->GetConfig().bPerformVoxelFiltering);
+//			AdditionalData += FString::Printf(TEXT("# Generate Detailed Mesh\n"));
+//			AdditionalData += FString::Printf(TEXT("rd_gdm %d\n"), CurrentGen->GetConfig().bGenerateDetailedMesh);
+//			AdditionalData += FString::Printf(TEXT("# MaxPolysPerTile\n"));
+//			AdditionalData += FString::Printf(TEXT("rd_mppt %d\n"), CurrentGen->GetConfig().MaxPolysPerTile);
+//			AdditionalData += FString::Printf(TEXT("# maxVertsPerPoly\n"));
+//			AdditionalData += FString::Printf(TEXT("rd_mvpp %d\n"), CurrentGen->GetConfig().maxVertsPerPoly);
+//			AdditionalData += FString::Printf(TEXT("# Tile size\n"));
+//			AdditionalData += FString::Printf(TEXT("rd_ts %d\n"), CurrentGen->GetConfig().tileSize);
+//
+//			AdditionalData += FString::Printf(TEXT("\n"));
+//
+//			const FString FilePathName = FileName + ".obj";// +FString::Printf(TEXT("_NavDataSet%d_%s.obj"), Index, *CurrentTimeStr);
+//			ExportGeomToOBJFile(FilePathName, CoordBuffer, IndexBuffer, AdditionalData);
+//		}
+//	}
+//	UE_LOG(LogNavigation, Log, TEXT("ExportNavigation time: %.3f sec ."), FPlatformTime::Seconds() - StartExportTime);
 }
 
 void FExportNavMesh::GrowConvexHull(const float ExpandBy, const TArray<FVector>& Verts, TArray<FVector>& OutResult)
